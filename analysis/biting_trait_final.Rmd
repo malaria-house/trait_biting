@@ -1,0 +1,735 @@
+---
+title: "Biting bias by beta-globin type"
+author: "CFM"
+date: "2025-08-06"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Data shaping
+
+First, let's load the clean data from imbibe (Markwalter, Lapp et al. Nat Comms 2024) and generate new dataframes with only the people who were genotyped (beta-globin).
+
+```{r}
+library(glmmTMB)
+library(broom.mixed)
+library(DescTools)
+library(ggpubr)
+library(tidyverse)
+library(gtsummary)
+library(modelr)
+library(ggtext)
+library(scales)
+library(mlogit)
+library(epiR)
+
+# set seed to be able to get same result for simulation
+set.seed(20231027)
+
+# set plotting theme
+theme_set(theme_bw() + 
+            theme(text = element_text(size = 15),
+                  strip.background = element_rect(fill = 'white', color = 'white')))
+
+matches <- read_csv('data/clean_from_imbibe/mosquito_bistro.csv')
+
+hu_dat <- read_csv('data/clean_from_imbibe/monthly_visits.csv') |> 
+  drop_na(person_id)
+
+model_dat <- read_csv("data/clean_from_imbibe/model_dat.csv") %>%
+  select(mosquito_collection_date, n_bites_person_hh_day, prop_bites_person_hh_day, bitten, n_str_mosq,
+         age_28feb2021, age_cat, gender, slept_net, transmission_season, 
+         hh_rdt_prev_30, rdt_pos_cat, pf_pcr_infection_status, collect_diff_visit,
+         n_mem_in_ss, n_people_hh_day, person_id, m_hh, m_village, hh_date) %>% 
+  mutate(slept_net = factor(slept_net, levels = c("No", "Yes")),
+         age_cat = factor(age_cat, levels = c('>15', '5-15', '<5')),
+         transmission_season = factor(transmission_season, levels = c('Low', 'High'))) %>%
+  drop_na() 
+
+hu_pos <- read_csv("data/clean_from_imbibe/hu_pos.csv")
+
+model_dat_long <- read_csv("data/clean_from_imbibe/model_dat_long.csv")
+
+trait <- readxl::read_excel('../../PROJECT_DGHI_OBAMA_OPS/obama_data/lab_data/duke/beta-globin types/OBAMA betaglobin typing.xlsx', sheet = "typing results") |> 
+  filter(`beta globin type` != "pending") |> 
+  rename(M_ID = personID) |> 
+  select(!contains("..")) 
+
+lookup <- read_csv('data/STR/lookup_table.csv')
+```
+
+
+Now lets narrow down to people who have been typed and remove the one individual with HbSS.
+
+
+```{r}
+
+#narrow down to people who have been typed and remove SS
+
+trait <- trait |> 
+  mutate(hh = substr(M_ID,1,3)) |> 
+  filter(`beta globin type` != "SS")
+
+model_dat_t <- model_dat |> 
+  left_join(lookup, by = "person_id") |> 
+  left_join(trait |> 
+              #select(-`Date released`) |> 
+              rename(beta_glob = `beta globin type`), by = "M_ID") |> 
+  select(-M_ID, -str_id) |> 
+  distinct() |> 
+  drop_na()
+
+hu_dat_t <- hu_dat |>
+  select(-M_ID) |> 
+  left_join(lookup, by = "person_id") |> 
+  left_join(trait |> 
+              #select(-`Date released`) |> 
+              rename(beta_glob = `beta globin type`), by = "M_ID") |> 
+  select(-M_ID, -str_id) |> 
+  distinct() |> 
+  drop_na(beta_glob)
+
+model_dat_long_t <- model_dat_long |> 
+  select(-M_ID) |> 
+  left_join(lookup, by = "person_id") |> 
+  left_join(trait |> 
+              #select(-`Date released`) |> 
+              rename(beta_glob = `beta globin type`), by = "M_ID") |> 
+  select(-M_ID, -str_id) |> 
+  distinct() |> 
+  drop_na(beta_glob)
+
+```
+
+# Numbers of households and mosquitoes
+
+First, how many households consented to trait typing?
+
+```{r}
+
+trait |> 
+  select(hh) |> 
+  distinct() |> 
+  nrow()
+```
+
+
+let's look at how many unique households are in our model data. To be included in the model data, at least one mosquito had to match to that household.
+
+```{r}
+model_dat_t |> 
+  select(m_hh) |> 
+  distinct() |> 
+  nrow()
+```
+
+
+Now let's narrow down the mosquito data to the households for which we have trait data. We'll start with the match data, since that's most straightforward.
+
+```{r}
+
+matches_t <- matches |> 
+  filter(m_hh %in% trait$hh & (human_id %in% trait$M_ID | is.na(human_id)))
+
+```
+
+Number of bloodmeals available for STR typing
+
+```{r}
+matches_t |> 
+  select(bloodmeal_id) |> 
+  distinct() |> 
+  nrow()
+```
+
+Number returning human alleles
+
+```{r}
+matches_t |> 
+  filter(locus_count > 0) |> 
+  select(bloodmeal_id) |> 
+  distinct() |> 
+  nrow()
+```
+
+Number of unique mosquitoes that matched
+
+```{r}
+matches_t |> 
+  filter(match == "yes") |> 
+  select(bloodmeal_id) |> 
+  distinct() |> 
+  nrow()
+```
+
+Number of observed biting events
+
+```{r}
+sum(matches_t$match == "yes")
+```
+
+
+We'll pull in the rest of the mosquitoes here. We will require them to have been collected and immediately processed during the imbibe period in a household where at least one person consented to be genotyped.
+
+```{r}
+anoph <- read_csv("data/clean_from_imbibe/female_anopheles.csv")
+
+anoph_t <- anoph |> 
+  filter(reared == "no" & hh_id %in% trait$hh)
+
+anoph_t |> 
+  group_by(abdominal_status) |> 
+  count()
+```
+
+
+
+# Population characteristics
+
+Next, we'll look at some summary statistics for cohort members in the dataset.
+
+## Typed vs not typed
+
+Is the subset of people who were typed reasonably similar in characteristics to those who we didn't genotype?
+
+```{r}
+hu_dat |> 
+  filter(!is.na(age_28feb2021) & !is.na(pf_pcr_infection_status)) |>
+  mutate(age_cat = case_when(age_28feb2021 > 15 ~ '>15',
+                             age_28feb2021 < 5 ~ '<5',
+                             age_28feb2021 >= 5 & age_28feb2021 <= 15 ~ '5-15'),
+         age_cat = factor(age_cat, levels =c ('<5', '5-15', '>15')),
+         typed = case_when(person_id %in% hu_dat_t$person_id ~ "Typed",
+                           !person_id %in% hu_dat_t$person_id ~ "Not typed")) |> 
+  group_by(person_id, age_cat, gender, typed, village) |> 
+  summarize(slept_net = mean(slept_net == 'Yes', na.rm = TRUE), 
+            pf_pcr_infection = mean(pf_pcr_infection_status == 'positive', na.rm = TRUE)) |> 
+  ungroup() |> 
+  select(-person_id) |> 
+  tbl_summary(label = list(village ~ 'Village',
+                           age_cat ~ 'Age',
+                           gender ~ 'Gender',
+                           slept_net ~ 'Proportion of time slept under net',
+                           pf_pcr_infection ~ 'Proportion of time infected with P. falciparum'),
+              by = typed) |> 
+  add_p()
+```
+
+As expected, village is associated with being typed, since we dropped Lurare before participants had the opportunity to consent to genotyping. This is also probably why proportion of time infected is higher for genotyped people, since Lurare had low prevalence relative to the other villages. I'm not concerned about these differences. 
+
+
+Let's do some other quick checks - like proportion in each village. Note that Lurare was not eligible to consent for beta-globin typing.
+
+```{r}
+hu_dat |> 
+  filter(!is.na(age_28feb2021) & !is.na(pf_pcr_infection_status)) |>
+  mutate(age_cat = case_when(age_28feb2021 > 15 ~ '>15',
+                             age_28feb2021 < 5 ~ '<5',
+                             age_28feb2021 >= 5 & age_28feb2021 <= 15 ~ '5-15'),
+         age_cat = factor(age_cat, levels =c ('<5', '5-15', '>15')),
+         typed = case_when(person_id %in% hu_dat_t$person_id ~ "Typed",
+                           !person_id %in% hu_dat_t$person_id ~ "Not typed")) |> 
+  select(person_id, village, typed) |> 
+  distinct() |> 
+  ggplot(aes(x = village, fill = typed)) +
+  geom_bar(position = "fill") +
+  labs(x = "Village", y = "Proportion of people", fill = "")
+```
+
+
+## Number of DBS and pcr positivity
+
+```{r}
+hu_dat_t <- hu_dat_t |> 
+  filter(beta_glob != "SS")
+
+hu_dat_t |> 
+  filter(!is.na(dbs_barcode)) |> 
+  select(dbs_barcode) |> 
+  distinct() |>
+  nrow()
+
+hu_dat_t |> 
+  filter(!is.na(dbs_barcode)) |> 
+  select(dbs_barcode, pf_pcr_infection_status) |> 
+  distinct() |> 
+  group_by(pf_pcr_infection_status) |> 
+  count()
+
+
+```
+
+
+
+## Characteristics by beta-globin type
+
+Now let's compare characteristics of people accross beta-globin types.
+
+```{r}
+hu_dat_t |> 
+  filter(!is.na(age_28feb2021) & !is.na(pf_pcr_infection_status) & beta_glob != "SS") |>
+  mutate(age_cat = case_when(age_28feb2021 > 15 ~ '>15',
+                             age_28feb2021 < 5 ~ '<5',
+                             age_28feb2021 >= 5 & age_28feb2021 <= 15 ~ '5-15'),
+         age_cat = factor(age_cat, levels =c ('<5', '5-15', '>15'))) |> 
+  group_by(person_id, age_cat, gender, beta_glob) |> 
+  summarize(slept_net = mean(slept_net == 'Yes', na.rm = TRUE), 
+            pf_pcr_infection = mean(pf_pcr_infection_status == 'positive', na.rm = TRUE)) |> 
+  ungroup() |> 
+  select(-person_id) |> 
+  tbl_summary(label = list(age_cat ~ 'Age',
+                           gender ~ 'Gender',
+                           slept_net ~ 'Proportion of time slept under net',
+                           pf_pcr_infection ~ 'Proportion of time infected with P. falciparum'),
+              by = beta_glob) |> 
+  add_p()
+```
+
+
+Only difference is that folks with AS were infected more (almost significant). The difference is quite small and confidence intervals almost completely overlap), so this difference doesn't seem to be terribly meaningful.
+
+# Bites by beta-globin type
+
+Now, let's take a look whether observed biting rates are different between AA and AS.
+
+```{r}
+
+n_months_in_study <- hu_dat_t %>%
+  filter(person_id %in% unique(model_dat_t$person_id)) %>%
+  mutate(age_cat = factor(case_when(age_28feb2021 > 15 ~ '>15',
+                              age_28feb2021 < 5 ~ '<5',
+                              TRUE ~ '5-15'),
+                           levels = c('<5', '5-15', '>15'))) %>% 
+  group_by(person_id, gender, age_cat) %>% 
+  summarise(months_in_study = n())
+
+model_dat_person <- model_dat_t %>% 
+  group_by(person_id, gender, age_cat, beta_glob) %>% 
+  summarise(n_bites = sum(n_bites_person_hh_day)) %>% 
+  ungroup() |> 
+  left_join(n_months_in_study |>
+              ungroup() |> 
+              select(person_id, months_in_study) |> 
+              distinct()) %>% 
+  filter(!is.na(months_in_study)) |>  
+  group_by(person_id, gender, age_cat, beta_glob) %>% 
+  summarise(n_bites = sum(n_bites),
+            n_people = n_distinct(person_id),
+            n_months = sum(months_in_study),
+            bites_per_month = ((n_bites/n_months)/2)*30*n_people,
+            bites_per_person_month = n_bites/n_months/2*30,
+            bites_per_person_night = bites_per_person_month/30,
+            bites_per_person_year = bites_per_person_month*12) 
+```
+
+
+First, we will look at the number of bites we observed during the study period for each person. Note that this is not corrected for time in the study.
+
+
+```{r}
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS") |> 
+  ggplot(aes(x = beta_glob, y = n_bites)) +
+  geom_boxplot() +
+  labs(x = "Beta-globin type", y = "Number of bites observed") +
+  stat_compare_means()
+```
+
+
+No statistical difference here, but the median for AS is slightly elevated vs AA.
+
+Now let's take into account the number of months spent in the study, estimate the monthly biting rates for each person, and compare between AA and AS. We'll make quite a few options for visualizations to choose for Fig 1.
+
+
+```{r}
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS") |> 
+  ggplot(aes(x = beta_glob, y = bites_per_month)) +
+  geom_boxplot() +
+  labs(x = "Beta-globin type", y = "Estimated monthly bites") +
+  stat_compare_means()
+
+model_dat_person |> 
+  filter(beta_glob != "SS") |> 
+  ggplot(aes(x = bites_per_month, fill = beta_glob)) +
+  geom_histogram(color = "white", linewidth = 0.2) +
+  geom_hline(yintercept = 0, color = "lightgrey") +
+  scale_fill_viridis_d(begin = 0.1, end = 0.5) +
+  labs(x = "Estimated monthly bites", y = "Number of people", fill = "Beta-globin\ntype")
+
+(fig1 <- model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS") |> 
+  mutate(bites_per_month = case_when(bites_per_month == 0 ~ 0.1,
+                                     TRUE ~ bites_per_month)) |> 
+  ggplot(aes(x = beta_glob, y = bites_per_month)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_jitter(width = 0.1, height = 0, alpha = 0.3) +
+  stat_compare_means(label.x = 1.35) +
+  coord_trans(y = "log1p",) +
+  scale_y_continuous(breaks = c(0.1,1,5,10,20,30,40,50), labels = paste0(c(0,1,5,10,20,30,40,50))) +
+  labs(x = "Beta-globin type", y = "Estimated monthly bites"))
+
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS") |> 
+  group_by(beta_glob) |> 
+  summarise(med = median(bites_per_month, na.rm = TRUE),
+            mean = mean(bites_per_month, na.rm = TRUE),
+            low25 = quantile(bites_per_month, prob = 0.25, na.rm = TRUE),
+            high75 = quantile(bites_per_month, prob = 0.75, na.rm = TRUE),
+            sd = sd(bites_per_month, na.rm = TRUE))
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS" & bites_per_month > 0) |> 
+  group_by(beta_glob) |> 
+  summarise(med = median(bites_per_month, na.rm = TRUE),
+            mean = mean(bites_per_month, na.rm = TRUE),
+            low25 = quantile(bites_per_month, prob = 0.25, na.rm = TRUE),
+            high75 = quantile(bites_per_month, prob = 0.75, na.rm = TRUE),
+            sd = sd(bites_per_month, na.rm = TRUE))
+```
+
+AS seems to have slightly higher biting rates. The difference is not statistically significant. 
+
+
+Let's get the medians and IQRs for reporting. Note this is among people who received at least one bite:
+
+```{r}
+model_dat_person |> 
+  filter(beta_glob != "SS") |> 
+  filter(bites_per_month >0) |> 
+  group_by(beta_glob) |> 
+  summarise(med_bites = median(bites_per_month),
+            bites25 = quantile(bites_per_month, probs = 0.25),
+            bites75 = quantile(bites_per_month, probs = 0.75))
+```
+
+
+
+## Biting bias model
+
+Although the descriptives above suggest that one beta-globin type isn't being bitten more than the other, we'll plug the variable into our risk factor analysis to account for all of the co-variates and adjustors we looked at previously.
+
+The unit of analysis for the model is person-nights, so let's take a look at the person-night characteristics across people who were and weren't bitten in this subset of the cohort.
+
+We'll start with a summary table.
+
+```{r}
+model_dat_t |> 
+  filter(beta_glob != "SS") |> 
+  select(bitten, age_cat, gender, beta_glob, slept_net, pf_pcr_infection_status, n_mem_in_ss, rdt_pos_cat,  n_people_hh_day, n_str_mosq, transmission_season) |> 
+  mutate(bitten = ifelse(bitten == 0, 'Not bitten', 'Bitten')) |> 
+  tbl_summary(by = bitten, type = list(n_mem_in_ss ~ 'continuous'),
+              label = list(age_cat ~ 'Age',
+                           gender ~ 'Gender',
+                           beta_glob ~ 'Beta-globin type',
+                           slept_net ~ 'Slept under net',
+                           pf_pcr_infection_status ~ 'Infected with P. falciparum',
+                           n_mem_in_ss ~ 'Number of people in sleeping space',
+                           rdt_pos_cat ~ 'RDT+ household member in prior month',
+                           n_people_hh_day ~ 'Number of people present in household',
+                           n_str_mosq ~ 'Number of STR-typed mosquitoes collected in household',
+                           transmission_season ~ 'Transmission season')) |> 
+  add_overall() |> 
+  add_p(pvalue_fun = function(x) signif(x, 1))
+```
+
+Note that we see significant differences (and similar-ish proportions) in the same variables we did for the whole cohort. Notably there is not a difference in the bitten/not bitten person-nights across beta-globin types.
+
+
+Now let's run the risk factor analysis with beta-globin type.
+
+
+```{r}
+nb2 <- model_dat_t %>%
+  filter(beta_glob != "SS") %>%
+  glmmTMB(n_bites_person_hh_day ~ age_cat + gender + beta_glob + slept_net  + pf_pcr_infection_status + n_mem_in_ss + n_people_hh_day + n_str_mosq + transmission_season + (1|person_id),
+          family = nbinom2, 
+          data = .)
+
+
+
+forest_plot_dat <- nb2 %>% 
+  tidy(exp = TRUE, conf.int = TRUE) %>% 
+  filter(term != 'sd__(Intercept)' & term != '(Intercept)') %>% 
+  mutate(term = case_when(term == 'slept_netYes' ~ 'Slept under net',
+                          term == 'pf_pcr_infection_statuspositive' ~ 'Infected with<br>*P. falciparum*',
+                          term == 'n_str_mosq' ~ 'Number of STR-typed<br>mosquitoes in household',
+                          term == 'transmission_seasonHigh' ~ 'High transmission season',
+                          term == 'n_people_hh_day' ~ 'Number of household<br>members',
+                          term == 'rdt_pos_catYes' ~ 'RDT+ household<br>member in prior month',
+                          term == 'n_mem_in_ss' ~ 'Number of people<br>in sleeping space',
+                          term == 'beta_globAS' ~ 'Beta-globin AS<br>(vs AA)',
+                          term == 'genderMale' ~ 'Male',
+                          term == 'age_cat5-15' ~ '5-15 years old<br>(vs. >15 years old)',
+                          term == 'age_cat<5' ~ '<5 years old<br>(vs. >15 years old)',
+                          TRUE ~ term)) %>% 
+  mutate(adjustor = ifelse(term %in% c('High transmission season', 'Number of STR-typed<br>mosquitoes in household', 'Number of household<br>members', 'RDT+ household<br>member in prior month', 'Number of people<br>in sleeping space'), "yes", "no"),
+         term = factor(term, levels = c('Infected with<br>*P. falciparum*', 'Slept under net', '5-15 years old<br>(vs. >15 years old)', '<5 years old<br>(vs. >15 years old)', 'Male', 'Beta-globin AS<br>(vs AA)', 'Number of people<br>in sleeping space', 'RDT+ household<br>member in prior month', 'Number of household<br>members', 'Number of STR-typed<br>mosquitoes in household', 'High transmission season')))
+
+forest_plot_dat |> 
+  mutate(term = factor(term, levels = rev(levels(term)))) |> 
+  arrange(term) |> 
+  mutate(est = paste0(round(estimate, 2), ' (', round(conf.low, 2), '-', round(conf.high, 2), ')')) |> 
+  select(term, est)
+
+(forest_plot <- forest_plot_dat %>%
+  filter(adjustor == 'no') |> 
+  select(term, estimate, conf.low, conf.high) |> 
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = term)) +
+  geom_vline(xintercept = 1, linetype = 'dotted') +
+  geom_pointrange() +
+  scale_x_continuous(trans = 'log', breaks = c(0, 0.25, 0.5, 1, 2)) +
+  geom_text(aes(label = paste0(round(estimate, 2), " (", round(conf.low,2), ", ", round(conf.high,2), ")")), x = 1.4) +
+    coord_cartesian(clip = 'off') +
+  labs(x = 'Biting Rate Ratio (BRR)', y = '', title = 'BRR (95% CI)') +
+  theme(strip.text = element_blank(), plot.margin = unit(c(1,8,1,0), "lines"), 
+        plot.title = element_text(size = 12, hjust = 1.7, face = "bold"),
+        axis.text.y = element_markdown()))
+
+
+```
+
+Number of person-nights
+```{r}
+model_dat_t |> 
+  filter(beta_glob != "SS") |> 
+  select(mosquito_collection_date, person_id) |> 
+  distinct() |> 
+  nrow()
+```
+
+
+We see a null biting rate ratio for AS vs AA, but the trends in the other variables are about what we expect given our analyses across the whole cohort.
+
+
+# Interaction beta-globin*infection
+
+```{r}
+nb2_int <- model_dat_t %>%
+  filter(beta_glob != "SS") %>%
+  glmmTMB(n_bites_person_hh_day ~ age_cat + gender + beta_glob + slept_net  + pf_pcr_infection_status + n_mem_in_ss + n_people_hh_day + n_str_mosq + transmission_season + pf_pcr_infection_status*beta_glob + (1|person_id),
+          family = nbinom2, 
+          data = .)
+
+
+summary(nb2_int)
+
+```
+
+
+
+# Age-stratified RFA
+
+We want to see if any protection could be attributed to differential biting preferences between HbAS and HbAA in kids < 5 To assess this, we will run stratified RFA models.
+
+First let's get a sense of how many kiddos under 5 we have and what their characteristics look like:
+
+```{r}
+hu_dat_t |> 
+  filter(!is.na(age_28feb2021) & !is.na(pf_pcr_infection_status)) |>
+  mutate(age_cat = case_when(age_28feb2021 > 15 ~ '>15',
+                             age_28feb2021 < 5 ~ '<5',
+                             age_28feb2021 >= 5 & age_28feb2021 <= 15 ~ '5-15'),
+         age_cat = factor(age_cat, levels =c ('<5', '5-15', '>15'))) |> 
+  filter(age_cat == "<5" & beta_glob != "SS") |> 
+  group_by(person_id, gender, beta_glob) |> 
+  summarize(slept_net = mean(slept_net == 'Yes', na.rm = TRUE), 
+            pf_pcr_infection = mean(pf_pcr_infection_status == 'positive', na.rm = TRUE)) |> 
+  ungroup() |> 
+  select(-person_id) |> 
+  tbl_summary(label = list(gender ~ 'Gender',
+                           slept_net ~ 'Proportion of time slept under net',
+                           pf_pcr_infection ~ 'Proportion of time infected with P. falciparum'),
+              by = beta_glob) |> 
+  add_p()
+```
+The numbers are SO small. I'm not sure the model will be meaningful with such small numbers, but let's see...
+
+```{r}
+nb2_5 <- model_dat_t %>%
+  filter(beta_glob != "SS" & age_cat == "<5") %>%
+  glmmTMB(n_bites_person_hh_day ~ gender + beta_glob + slept_net + rdt_pos_cat + pf_pcr_infection_status + n_mem_in_ss + n_people_hh_day + n_str_mosq + transmission_season + (1|person_id),
+          family = nbinom2, 
+          data = .)
+
+forest_plot_dat_5 <- nb2_5 %>% 
+  tidy(exp = TRUE, conf.int = TRUE) %>% 
+  filter(term != 'sd__(Intercept)' & term != '(Intercept)') %>% 
+  mutate(term = case_when(term == 'slept_netYes' ~ 'Slept under net',
+                          term == 'pf_pcr_infection_statuspositive' ~ 'Infected with<br>*P. falciparum*',
+                          term == 'n_str_mosq' ~ 'Number of STR-typed<br>mosquitoes in household',
+                          term == 'transmission_seasonHigh' ~ 'High transmission season',
+                          term == 'n_people_hh_day' ~ 'Number of household<br>members',
+                          term == 'rdt_pos_catYes' ~ 'RDT+ household<br>member in prior month',
+                          term == 'n_mem_in_ss' ~ 'Number of people<br>in sleeping space',
+                          term == 'beta_globAS' ~ 'Beta-globin AS<br>(vs AA)',
+                          term == 'genderMale' ~ 'Male',
+                          TRUE ~ term)) %>% 
+  mutate(adjustor = ifelse(term %in% c('High transmission season', 'Number of STR-typed<br>mosquitoes in household', 'Number of household<br>members', 'RDT+ household<br>member in prior month', 'Number of people<br>in sleeping space'), "yes", "no"),
+         term = factor(term, levels = c('Infected with<br>*P. falciparum*', 'Slept under net', 'Male', 'Beta-globin AS<br>(vs AA)', 'Number of people<br>in sleeping space', 'RDT+ household<br>member in prior month', 'Number of household<br>members', 'Number of STR-typed<br>mosquitoes in household', 'High transmission season')))
+
+forest_plot_dat_5 |> 
+  mutate(term = factor(term, levels = rev(levels(term)))) |> 
+  arrange(term) |> 
+  mutate(est = paste0(round(estimate, 2), ' (', round(conf.low, 2), '-', round(conf.high, 2), ')')) |> 
+  select(term, est)
+
+(forest_plot_5 <- forest_plot_dat_5 %>%
+  filter(adjustor == 'no') |> 
+  select(term, estimate, conf.low, conf.high) |> 
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = term)) +
+  geom_vline(xintercept = 1, linetype = 'dotted') +
+  geom_pointrange() +
+  scale_x_continuous(trans = 'log', breaks = c(0, 0.25, 0.5, 1, 2)) +
+  geom_text(aes(label = paste0(round(estimate, 2), " (", round(conf.low,2), ", ", round(conf.high,2), ")")), x = 3.9) +
+    coord_cartesian(clip = 'off') +
+  labs(x = 'Biting Rate Ratio (BRR)', y = '', title = 'BRR (95% CI)') +
+  theme(strip.text = element_blank(), plot.margin = unit(c(1,8,1,0), "lines"), 
+        plot.title = element_text(size = 12, hjust = 1.4, face = "bold"),
+        axis.text.y = element_markdown()))
+
+
+
+```
+
+So the confidence intervals here are very wide, but the direction is to the left of null. Let's just look at AA/AS estimate stratified by age.
+
+```{r}
+nb2_5.1 <- model_dat_t %>%
+  filter(beta_glob != "SS" & age_cat == "<5") %>%
+  glmmTMB(n_bites_person_hh_day ~ gender + beta_glob + slept_net + rdt_pos_cat + pf_pcr_infection_status + n_mem_in_ss + n_people_hh_day + n_str_mosq + transmission_season + (1|person_id),
+          family = nbinom2, 
+          data = .)
+
+nb2_5.15 <- model_dat_t %>%
+  filter(beta_glob != "SS" & age_cat == "5-15") %>%
+  glmmTMB(n_bites_person_hh_day ~ gender + beta_glob + slept_net + rdt_pos_cat + pf_pcr_infection_status + n_mem_in_ss + n_people_hh_day + n_str_mosq + transmission_season + (1|person_id),
+          family = nbinom2, 
+          data = .)
+
+nb2_15 <- model_dat_t %>%
+  filter(beta_glob != "SS" & age_cat == ">15") %>%
+  glmmTMB(n_bites_person_hh_day ~ gender + beta_glob + slept_net + rdt_pos_cat + pf_pcr_infection_status + n_mem_in_ss + n_people_hh_day + n_str_mosq + transmission_season + (1|person_id),
+          family = nbinom2, 
+          data = .)
+
+forest_plot_dat <- nb2_5.1 %>% 
+  tidy(exp = TRUE, conf.int = TRUE) %>% 
+  filter(term == 'beta_globAS') %>% 
+  mutate(term = case_when(term == 'beta_globAS' ~ 'Beta-globin AS<br>(vs AA)',
+                          TRUE ~ term)) |> 
+  mutate(age_cat = "<5") |> 
+  bind_rows(nb2_5.15 %>% 
+  tidy(exp = TRUE, conf.int = TRUE) %>% 
+  filter(term == 'beta_globAS') %>% 
+  mutate(term = case_when(term == 'beta_globAS' ~ 'Beta-globin AS<br>(vs AA)',
+                          TRUE ~ term)) |> 
+    mutate(age_cat = "5-15")) |> 
+  bind_rows(nb2_15 %>% 
+  tidy(exp = TRUE, conf.int = TRUE) %>% 
+  filter(term == 'beta_globAS') %>% 
+  mutate(term = case_when(term == 'beta_globAS' ~ 'Beta-globin AS<br>(vs AA)',
+                          TRUE ~ term)) |> 
+    mutate(age_cat = ">15"))
+  
+forest_plot_dat |> 
+  mutate(est = paste0(round(estimate, 2), ' (', round(conf.low, 2), '-', round(conf.high, 2), ')')) |> 
+  select(term, age_cat, est)
+
+(fig3b <- forest_plot_dat %>%
+  mutate(age_cat = factor(age_cat, levels = c("<5", "5-15", ">15"))) |> 
+  select(age_cat, estimate, conf.low, conf.high) |> 
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = age_cat)) +
+  geom_vline(xintercept = 1, linetype = 'dotted') +
+  geom_pointrange() +
+  scale_x_continuous(trans = 'log', breaks = c(0, 0.25, 0.5, 1, 2)) +
+  geom_text(aes(label = paste0(round(estimate, 2), " (", round(conf.low,2), ", ", round(conf.high,2), ")")), x = 2) +
+    coord_cartesian(clip = 'off') +
+  labs(x = 'AS vs AA\nBiting Rate Ratio (BRR)', y = 'Age (years)', title = 'BRR (95% CI)') +
+  theme(strip.text = element_blank(), plot.margin = unit(c(1,8,1,0), "lines"), 
+        plot.title = element_text(size = 12, hjust = 1.7, face = "bold")))
+
+
+```
+
+
+
+Just descriptive
+
+```{r}
+(fig3a <- model_dat_person |> 
+  ungroup() |> 
+  mutate(age_cat = factor(age_cat, levels = c("<5", "5-15", ">15"))) |> 
+  filter(beta_glob != "SS") |> 
+  ggplot(aes(x = age_cat, color = beta_glob, y = n_bites)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.5) +
+  stat_summary(
+    aes(group = beta_glob), fun = mean, fun.min = mean, fun.max = mean,
+    geom = "crossbar", color = "black", width = 0.7, lwd = 0.4,
+    position=position_dodge(width=0.75)
+  ) +
+  labs(color = "Beta-globin\ntype", x = "Age (years)", y = "Estimated bites/month") )
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS", age_cat == "<5") %>%
+  t.test(bites_per_month ~ beta_glob, data = .)
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS", age_cat == "<5") %>%
+  wilcox.test(bites_per_month ~ beta_glob, data = .)
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS", age_cat == "5-15") %>%
+  t.test(bites_per_month ~ beta_glob, data = .)
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS", age_cat == "5-15") %>%
+  wilcox.test(bites_per_month ~ beta_glob, data = .)
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS", age_cat == ">15") %>%
+  t.test(bites_per_month ~ beta_glob, data = .)
+
+model_dat_person |> 
+  ungroup() |> 
+  filter(beta_glob != "SS", age_cat == ">15") %>%
+  wilcox.test(bites_per_month ~ beta_glob, data = .)
+
+```
+
+
+# Writing figures
+```{r}
+ggsave(plot = fig1, filename = "analysis/trait_figures/fig1.png", width = 6, height = 4)
+ggsave(plot = forest_plot, filename = "analysis/trait_figures/fig2.png", width = 6, height = 4)
+ggsave(plot = fig3a, filename = "analysis/trait_figures/fig3a.png", width = 6, height = 4)
+ggsave(plot = fig3b, filename = "analysis/trait_figures/fig3b.png", width = 6, height = 4)
+
+fig3 <- ggarrange(fig3a,
+          fig3b,
+          ncol = 1,
+          heights = c(1,1.2),
+          labels = c("A", "B"))
+
+ggsave(plot = fig3, filename = "analysis/trait_figures/fig3.png", width = 5, height = 7)
+```
+
