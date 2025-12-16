@@ -676,13 +676,14 @@ Just descriptive
   mutate(age_cat = factor(age_cat, levels = c("<5", "5-15", ">15"))) |> 
   filter(beta_glob != "SS") |> 
   ggplot(aes(x = age_cat, color = beta_glob, y = n_bites)) +
-  geom_jitter(position = position_jitterdodge(), alpha = 0.5) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.8) +
   stat_summary(
     aes(group = beta_glob), fun = mean, fun.min = mean, fun.max = mean,
     geom = "crossbar", color = "black", width = 0.7, lwd = 0.4,
     position=position_dodge(width=0.75)
   ) +
-  labs(color = "Beta-globin\ntype", x = "Age (years)", y = "Estimated bites/month") )
+  labs(color = "Beta-globin\ntype", x = "Age (years)", y = "Estimated bites/month")+
+   scale_color_manual(values = c("#fc8d59", "#99d594")))
 
 model_dat_person |> 
   ungroup() |> 
@@ -719,10 +720,10 @@ model_dat_person |>
 
 # Writing figures
 ```{r}
-ggsave(plot = fig1, filename = "analysis/trait_figures/fig1.png", width = 6, height = 4)
-ggsave(plot = forest_plot, filename = "analysis/trait_figures/fig2.png", width = 6, height = 4)
-ggsave(plot = fig3a, filename = "analysis/trait_figures/fig3a.png", width = 6, height = 4)
-ggsave(plot = fig3b, filename = "analysis/trait_figures/fig3b.png", width = 6, height = 4)
+ggsave(plot = fig1, filename = "analysis/trait_bites/trait_figures/fig1.tiff", width = 6, height = 4)
+ggsave(plot = forest_plot, filename = "analysis/trait_bites/trait_figures/fig2.tiff", width = 6, height = 4)
+ggsave(plot = fig3a, filename = "analysis/trait_bites/trait_figures/fig3a.tiff", width = 6, height = 4)
+ggsave(plot = fig3b, filename = "analysis/trait_bites/trait_figures/fig3b.tiff", width = 6, height = 4)
 
 fig3 <- ggarrange(fig3a,
           fig3b,
@@ -730,6 +731,6 @@ fig3 <- ggarrange(fig3a,
           heights = c(1,1.2),
           labels = c("A", "B"))
 
-ggsave(plot = fig3, filename = "analysis/trait_figures/fig3.png", width = 5, height = 7)
+ggsave(plot = fig3, filename = "analysis/trait_bites/trait_figures/fig3.tiff", width = 5, height = 7)
 ```
 
